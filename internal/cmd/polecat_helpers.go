@@ -225,6 +225,39 @@ func rigPrefix(r *rig.Rig) string {
 	return beads.GetPrefixForRig(townRoot, r.Name)
 }
 
+// listRigAgentBeads returns the agent beads (gt:agent) that describe a rig's
+// polecats. Agent beads live in the TOWN database regardless of their ID
+// prefix (see beads.ForAgentBead), and every writer (gt done, witness,
+// refinery, check-recovery) targets that database. Listing through a plain
+// rig-rooted wrapper only sees the rig's own database, where agent beads are
+// absent, so cleanup_status/agent_state read as missing and cleanly finished
+// polecats were classified NEEDS_RECOVERY (hq-aya). Query the town database
+// (authoritative) and fall back to the rig database for legacy rig-local
+// agent beads.
+func listRigAgentBeads(rigBeads *beads.Beads) (map[string]*beads.Issue, error) {
+	townAgents, err := rigBeads.ForAgentBead().ListAgentBeads()
+	if err != nil {
+		return nil, err
+	}
+	rigAgents, rigErr := rigBeads.ListAgentBeads()
+	if rigErr != nil {
+		return townAgents, nil
+	}
+	return mergeAgentBeadMaps(townAgents, rigAgents), nil
+}
+
+// mergeAgentBeadMaps merges two agent-bead maps; entries in primary win.
+func mergeAgentBeadMaps(primary, fallback map[string]*beads.Issue) map[string]*beads.Issue {
+	merged := make(map[string]*beads.Issue, len(primary)+len(fallback))
+	for id, issue := range fallback {
+		merged[id] = issue
+	}
+	for id, issue := range primary {
+		merged[id] = issue
+	}
+	return merged
+}
+
 func polecatBeadIDForRig(r *rig.Rig, rigName, polecatName string) string {
 	return beads.PolecatBeadIDWithPrefix(rigPrefix(r), rigName, polecatName)
 }
