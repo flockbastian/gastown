@@ -588,6 +588,16 @@ func normalizeAddress(s string) string {
 	return s
 }
 
+// sameIdentity reports whether a and b name the same agent, ignoring the
+// spelling differences normalizeAddress folds away (trailing slash on
+// mayor/deacon, crew/polecats path segments). Empty identities never match.
+func sameIdentity(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return normalizeAddress(a) == normalizeAddress(b)
+}
+
 // AddressToIdentity converts a GGT address to a beads identity.
 //
 // Addresses use slash format:

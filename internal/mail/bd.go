@@ -3,7 +3,9 @@ package mail
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -109,6 +111,44 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 	}
 
 	return stdout.Bytes(), nil
+}
+
+// closeActorMismatchRe matches bd's ownership-guard failure on close:
+//
+//	cannot close hq-abc: assignee is "mayor/", actor is "mayor"
+var closeActorMismatchRe = regexp.MustCompile(`cannot close \S+: assignee is "([^"]*)", actor is "([^"]*)"`)
+
+// closeActorMismatch extracts the assignee and actor from bd's ownership-guard
+// error. ok is false for any other error.
+func closeActorMismatch(err error) (assignee, actor string, ok bool) {
+	var bdErr *bdError
+	if !errors.As(err, &bdErr) {
+		return "", "", false
+	}
+	m := closeActorMismatchRe.FindStringSubmatch(bdErr.Stderr)
+	if m == nil {
+		return "", "", false
+	}
+	return m[1], m[2], true
+}
+
+// runBdClose runs a bd close command. bd (>= 1.3) refuses to close a bead whose
+// assignee is not byte-equal to the ambient BD_ACTOR (modulo its own
+// canonicalisation, which does not strip a trailing "/"). gt treats "mayor" and
+// "mayor/" (and "rig/polecats/X" and "rig/X") as the same identity, so when the
+// guard trips on two spellings of one address, retry once acting as the bead's
+// actual assignee. Genuine mismatches (another actor's mail, a group address,
+// an empty actor) fail exactly as before; the ownership guard stays enabled.
+func runBdClose(ctx context.Context, args []string, workDir, beadsDir string) ([]byte, error) {
+	out, err := runBdCommand(ctx, args, workDir, beadsDir)
+	if err == nil {
+		return out, nil
+	}
+	assignee, actor, ok := closeActorMismatch(err)
+	if !ok || assignee == actor || !sameIdentity(assignee, actor) {
+		return out, err
+	}
+	return runBdCommand(ctx, args, workDir, beadsDir, "BD_ACTOR="+assignee)
 }
 
 // firstArg returns args[0] or "" when the slice is empty.

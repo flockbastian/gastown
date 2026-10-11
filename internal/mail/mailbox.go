@@ -605,7 +605,7 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err := runBdCommand(ctx, args, m.workDir, beadsDir)
+	_, err := runBdClose(ctx, args, m.workDir, beadsDir)
 	telemetry.RecordMailMessage(context.Background(), "read", telemetry.MailMessageInfo{
 		ID: id,
 		To: m.identity,

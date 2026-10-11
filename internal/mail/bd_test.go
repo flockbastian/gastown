@@ -506,3 +506,119 @@ func envLastValue(env []string, key string) (string, bool) {
 	}
 	return value, found
 }
+
+// writeMailBDCloseGuardStub installs a fake bd that mimics bd >= 1.3.1's
+// ownership guard on close: it fails unless $BD_ACTOR equals $FAKE_ASSIGNEE.
+// Each close invocation appends the BD_ACTOR it saw to $BD_STUB_LOG.
+func writeMailBDCloseGuardStub(t *testing.T, binDir string) {
+	t.Helper()
+	script := `#!/usr/bin/env sh
+if [ "$1" != "close" ]; then
+	exit 0
+fi
+printf '%s\n' "${BD_ACTOR-}" >> "$BD_STUB_LOG"
+if [ "${BD_ACTOR-}" != "$FAKE_ASSIGNEE" ]; then
+	printf 'cannot close %s: assignee is "%s", actor is "%s"\n' "$2" "$FAKE_ASSIGNEE" "${BD_ACTOR-}" >&2
+	exit 1
+fi
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMailboxClose_ActorSpellingMismatch(t *testing.T) {
+	tests := []struct {
+		name      string
+		identity  string
+		assignee  string // bead assignee as stored
+		actor     string // ambient BD_ACTOR
+		wantErr   bool
+		wantCalls []string // BD_ACTOR seen by each bd close invocation
+	}{
+		{"mayor slash assignee, bare actor", "mayor/", "mayor/", "mayor", false, []string{"mayor", "mayor/"}},
+		{"deacon slash assignee, bare actor", "deacon/", "deacon/", "deacon", false, []string{"deacon", "deacon/"}},
+		{"bare assignee, bare actor", "mayor/", "mayor", "mayor", false, []string{"mayor"}},
+		{"bare assignee, slash actor", "mayor/", "mayor", "mayor/", false, []string{"mayor/", "mayor"}},
+		{"polecat path actor, rig/name assignee", "gastown/Toast", "gastown/Toast", "gastown/polecats/Toast", false, []string{"gastown/polecats/Toast", "gastown/Toast"}},
+		{"crew path actor, rig/name assignee", "gastown/max", "gastown/max", "gastown/crew/max", false, []string{"gastown/crew/max", "gastown/max"}},
+		{"different actor", "mayor/", "deacon/", "mayor", true, []string{"mayor"}},
+		{"different rig polecat", "gastown/Toast", "gastown/Toast", "gastown/polecats/Nux", true, []string{"gastown/polecats/Nux"}},
+		{"empty actor", "mayor/", "mayor/", "", true, []string{""}},
+		{"group address", "mayor/", "@ops", "mayor", true, []string{"mayor"}},
+		{"queue address", "mayor/", "queue:work", "mayor", true, []string{"mayor"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			logPath := filepath.Join(t.TempDir(), "bd.log")
+			writeMailBDCloseGuardStub(t, binDir)
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("BD_STUB_LOG", logPath)
+			t.Setenv("FAKE_ASSIGNEE", tt.assignee)
+			t.Setenv("BD_ACTOR", tt.actor)
+
+			beadsDir := filepath.Join(t.TempDir(), ".beads")
+			if err := os.MkdirAll(beadsDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			m := NewMailboxWithBeadsDir(tt.identity, filepath.Dir(beadsDir), beadsDir)
+
+			err := m.closeInDir("hq-msg", beadsDir)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected close to fail")
+				}
+				// A genuine mismatch must surface bd's original guard error.
+				want := `cannot close hq-msg: assignee is "` + tt.assignee + `", actor is "` + tt.actor + `"`
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error = %q, want it to contain %q", err.Error(), want)
+				}
+			} else if err != nil {
+				t.Fatalf("closeInDir: %v", err)
+			}
+
+			got := strings.Split(strings.TrimSuffix(readStubLog(t, logPath), "\n"), "\n")
+			if strings.Join(got, "|") != strings.Join(tt.wantCalls, "|") {
+				t.Fatalf("bd close BD_ACTOR sequence = %q, want %q", got, tt.wantCalls)
+			}
+		})
+	}
+}
+
+func TestSameIdentity(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool
+	}{
+		{"mayor", "mayor/", true},
+		{"deacon/", "deacon", true},
+		{"mayor/", "mayor/", true},
+		{"gastown/polecats/Toast", "gastown/Toast", true},
+		{"gastown/crew/max", "gastown/max", true},
+		{"mayor", "deacon", false},
+		{"gastown/polecats/Toast", "gastown/Nux", false},
+		{"", "", false},
+		{"", "mayor", false},
+		{"@ops", "mayor", false},
+	}
+	for _, tt := range tests {
+		if got := sameIdentity(tt.a, tt.b); got != tt.want {
+			t.Errorf("sameIdentity(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestCloseActorMismatch(t *testing.T) {
+	err := &bdError{Err: errors.New("exit status 1"), Stderr: `Error: cannot close hq-lg8: assignee is "mayor/", actor is "mayor"`}
+	assignee, actor, ok := closeActorMismatch(err)
+	if !ok || assignee != "mayor/" || actor != "mayor" {
+		t.Fatalf("closeActorMismatch = %q, %q, %v", assignee, actor, ok)
+	}
+	if _, _, ok := closeActorMismatch(&bdError{Stderr: "issue not found"}); ok {
+		t.Fatal("unrelated bd error must not match")
+	}
+	if _, _, ok := closeActorMismatch(errors.New("boom")); ok {
+		t.Fatal("non-bd error must not match")
+	}
+}
