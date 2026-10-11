@@ -1,0 +1,136 @@
+name: Sandbox compat
+
+# Proves gt still behaves under srt (@anthropic-ai/sandbox-runtime), the macOS seatbelt sandbox Gas Town agents run
+# in. Under srt, kill(pid, 0) on a process outside the sandbox returns EPERM and a direct connect() to the tmux
+# socket returns EPERM; internal/pidalive and the tmux socket guard are patched to cope. This workflow builds gt,
+# runs the compat unit tests, then runs probe tests inside a real srt. See docs/sandbox-compat.md.
+
+on:
+  push:
+    branches: [ 'town/**' ]
+  pull_request:
+    paths:
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/sandbox-compat.yml'
+  schedule:
+    - cron: '17 6 * * 1' # weekly, Monday 06:17 UTC: catches srt/macOS drift
+  workflow_dispatch:
+
+concurrency:
+  group: sandbox-compat-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox-compat:
+    name: srt ${{ matrix.srt }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned: must stay green.
+          - os: macos-15
+            srt: '0.0.79'
+          # Drift detector: newest srt on the newest runner image.
+          - os: macos-latest
+            srt: latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install icu4c, tmux, ripgrep
+        run: |
+          # icu4c is keg-only and needed to build gt; ripgrep is an srt runtime dependency.
+          brew install icu4c tmux ripgrep
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '22'
+
+      - name: Install srt
+        run: npm i -g "@anthropic-ai/sandbox-runtime@${{ matrix.srt }}"
+
+      - name: Print versions
+        run: |
+          sw_vers
+          go version
+          tmux -V
+          node --version
+          npm ls -g @anthropic-ai/sandbox-runtime
+          command -v srt
+          srt --version || true
+
+      - name: Export icu4c CGO flags
+        run: |
+          prefix="$(brew --prefix icu4c)"
+          echo "CGO_CPPFLAGS=-I${prefix}/include" >> "$GITHUB_ENV"
+          echo "CGO_LDFLAGS=-L${prefix}/lib" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: make build
+
+      - name: Compat unit tests
+        # Deliberately narrow: must not select the tmux binding tests that already fail on tmux 3.7c.
+        run: go test -v ./internal/pidalive ./internal/tmux -run 'Pidalive|Lint|SocketGuard|Sandbox|TestEnsureNewSessionSocketSafe|TestNewSession(Allows|Refuses)'
+
+      - name: Prepare srt probe workspace
+        run: |
+          probe="$RUNNER_TEMP/srt-probe"
+          mkdir -p "$probe/bin" "$probe/tmp"
+          # Minimal settings: no network, writes only under the cwd, reads unrestricted. The tmux socket is
+          # deliberately NOT allowed, so the guard's direct dial gets EPERM.
+          cat > "$probe/probe.json" <<'JSON'
+          {"network":{"allowedDomains":[],"deniedDomains":[]},"filesystem":{"denyRead":[],"allowRead":[],"allowWrite":["."],"denyWrite":[]}}
+          JSON
+          # Fake tmux for use inside srt: the real one cannot reach its server from there.
+          cat > "$probe/bin/tmux" <<'SH'
+          #!/bin/sh
+          case " $* " in *" list-sessions "*) echo "probe: 1 windows" ;; esac
+          exit 0
+          SH
+          chmod +x "$probe/bin/tmux"
+          go test -c -o "$probe/pidalive.test" ./internal/pidalive
+          go test -c -o "$probe/tmux.test" ./internal/tmux
+          echo "SRT_PROBE_DIR=$probe" >> "$GITHUB_ENV"
+
+      - name: srt smoke
+        working-directory: ${{ env.SRT_PROBE_DIR }}
+        run: |
+          if ! srt -s probe.json -c 'test "$SANDBOX_RUNTIME" = 1'; then
+            echo "::error::srt cannot run a sandboxed command on this runner (seatbelt unavailable?); probes below would prove nothing"
+            exit 1
+          fi
+
+      - name: Probe pidalive under srt
+        working-directory: ${{ env.SRT_PROBE_DIR }}
+        run: |
+          # A live process outside the sandbox: srt cannot signal it, so kill(pid, 0) returns EPERM.
+          sleep 600 &
+          sleeper=$!
+          trap 'kill "$sleeper" 2>/dev/null || true' EXIT
+          srt -s probe.json -c "PIDALIVE_PROBE_PID=$sleeper TMPDIR=\$PWD/tmp ./pidalive.test -test.v -test.run '^TestPidaliveProbe\$'" 2>&1 | tee pidalive-probe.log
+          grep -q -- '--- PASS: TestPidaliveProbe' pidalive-probe.log || { echo "::error::pidalive probe did not pass"; exit 1; }
+          if grep -q -- '--- SKIP' pidalive-probe.log; then echo "::error::pidalive probe skipped unexpectedly"; exit 1; fi
+
+      - name: Probe tmux socket guard under srt
+        working-directory: ${{ env.SRT_PROBE_DIR }}
+        run: |
+          # A real tmux server outside the sandbox, on a socket the sandbox is not allowed to dial.
+          sock="gt-srt-probe-$$"
+          tmux -L "$sock" new-session -d -s probe 'sleep 600'
+          trap 'tmux -L "$sock" kill-server 2>/dev/null || true' EXIT
+          test -S "/tmp/tmux-$(id -u)/$sock"
+          srt -s probe.json -c "PATH=\$PWD/bin:\$PATH GT_SANDBOX_PROBE_SOCKET=$sock TMPDIR=\$PWD/tmp ./tmux.test -test.v -test.run '^TestSandboxSocketProbe\$'" 2>&1 | tee tmux-probe.log
+          grep -q -- '--- PASS: TestSandboxSocketProbe' tmux-probe.log || { echo "::error::tmux socket probe did not pass"; exit 1; }
+          if grep -q -- '--- SKIP' tmux-probe.log; then echo "::error::tmux socket probe skipped unexpectedly"; exit 1; fi
