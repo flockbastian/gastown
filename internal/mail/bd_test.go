@@ -506,3 +506,61 @@ func envLastValue(env []string, key string) (string, bool) {
 	}
 	return value, found
 }
+
+func TestCloseInDirRetriesAsAssigneeSpelling(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	script := `#!/usr/bin/env sh
+printf 'close actor=%s\n' "${BD_ACTOR-}" >> "$BD_STUB_LOG"
+if [ "${BD_ACTOR-}" != "$FAKE_ASSIGNEE" ]; then
+	printf 'cannot close hq-lg8: assignee is "%s", actor is "%s"; reclaim or use --force to override\n' "$FAKE_ASSIGNEE" "${BD_ACTOR-}" >&2
+	exit 1
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_STUB_LOG", logPath)
+
+	tests := []struct {
+		name      string
+		actor     string // ambient BD_ACTOR
+		assignee  string // bead assignee
+		identity  string // mailbox identity
+		wantErr   bool
+		wantCalls int
+	}{
+		{"mayor slash vs bare actor", "mayor", "mayor/", "mayor/", false, 2},
+		{"deacon slash vs bare actor", "deacon", "deacon/", "deacon/", false, 2},
+		{"bare assignee, slash actor", "mayor/", "mayor", "mayor/", false, 2},
+		{"polecat path actor vs rig/X assignee", "gastown/polecats/Toast", "gastown/Toast", "gastown/Toast", false, 2},
+		{"crew path actor vs rig/X assignee", "gastown/crew/max", "gastown/max", "gastown/max", false, 2},
+		{"exact match needs no retry", "mayor/", "mayor/", "mayor/", false, 1},
+		{"different actor still fails", "deacon", "mayor/", "mayor/", true, 1},
+		{"empty actor still fails", "", "mayor/", "mayor/", true, 1},
+		{"group address still fails", "mayor", "@town", "mayor/", true, 1},
+		{"other polecat still fails", "gastown/polecats/Nux", "gastown/Toast", "gastown/Toast", true, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(logPath, nil, 0644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("BD_ACTOR", tt.actor)
+			t.Setenv("FAKE_ASSIGNEE", tt.assignee)
+			m := NewMailboxBeads(tt.identity, t.TempDir())
+			err := m.closeInDir("hq-lg8", "")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), "cannot close hq-lg8: assignee is") {
+				t.Fatalf("error changed: %v", err)
+			}
+			if got := strings.Count(readStubLog(t, logPath), "close actor="); got != tt.wantCalls {
+				t.Fatalf("bd close calls = %d, want %d", got, tt.wantCalls)
+			}
+		})
+	}
+}

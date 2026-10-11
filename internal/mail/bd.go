@@ -3,7 +3,10 @@ package mail
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -151,4 +154,34 @@ func bdReadCtx() (context.Context, context.CancelFunc) {
 func bdWriteCtx() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(context.Background(), bdWriteTimeout)
 	return ctx, cancel
+}
+
+// closeMismatchRe matches bd's authority error for close:
+//
+//	cannot close hq-x: assignee is "mayor/", actor is "mayor"; reclaim ...
+var closeMismatchRe = regexp.MustCompile(`cannot close \S+: assignee is ("(?:[^"\\]|\\.)*"), actor is ("(?:[^"\\]|\\.)*")`)
+
+// closeActorMismatchAssignee inspects a failed `bd close` error. If bd rejected
+// it only because assignee and actor are spelled differently while gt treats
+// them as the same address (normalizeAddress: trailing slash on mayor/deacon,
+// rig/polecats/X vs rig/X), it returns the assignee string to retry as.
+// Genuine mismatches (different actor, empty actor/assignee) return false.
+func closeActorMismatchAssignee(err error) (string, bool) {
+	var be *bdError
+	if !errors.As(err, &be) {
+		return "", false
+	}
+	m := closeMismatchRe.FindStringSubmatch(be.Stderr)
+	if m == nil {
+		return "", false
+	}
+	assignee, err1 := strconv.Unquote(m[1])
+	actor, err2 := strconv.Unquote(m[2])
+	if err1 != nil || err2 != nil || assignee == "" || actor == "" || assignee == actor {
+		return "", false
+	}
+	if normalizeAddress(assignee) != normalizeAddress(actor) {
+		return "", false
+	}
+	return assignee, true
 }

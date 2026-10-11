@@ -606,6 +606,12 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
 	_, err := runBdCommand(ctx, args, m.workDir, beadsDir)
+	if assignee, ok := closeActorMismatchAssignee(err); ok {
+		// bd compares assignee and actor as strings; "mayor/" vs "mayor" (or
+		// rig/polecats/X vs rig/X) are the same identity to gt. Retry once,
+		// acting as the bead's actual assignee string.
+		_, err = runBdCommand(ctx, args, m.workDir, beadsDir, "BD_ACTOR="+assignee)
+	}
 	telemetry.RecordMailMessage(context.Background(), "read", telemetry.MailMessageInfo{
 		ID: id,
 		To: m.identity,
