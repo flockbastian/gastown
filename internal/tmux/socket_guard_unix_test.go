@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -299,5 +300,22 @@ func TestNewSessionVariantsUseSocketGuard(t *testing.T) {
 				t.Fatalf("error %q does not mention %s", err, socketPath)
 			}
 		})
+	}
+}
+
+func TestIsSocketDialDenied(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"eperm", &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.EPERM)}, true},
+		{"eacces", &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.EACCES)}, true},
+		{"refused", &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}, false},
+		{"other", fmt.Errorf("boom"), false},
+	} {
+		if got := isSocketDialDenied(tc.err); got != tc.want {
+			t.Errorf("%s: isSocketDialDenied = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

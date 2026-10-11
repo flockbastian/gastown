@@ -47,7 +47,12 @@ func (t *Tmux) ensureLiveSocketSafe(socketPath string) error {
 		if stale {
 			return nil
 		}
-		return fmt.Errorf("tmux socket %s exists but cannot be safely contacted: %w", socketPath, err)
+		// A sandbox (e.g. srt) can deny connect() to the tmux socket while still routing tmux commands
+		// through a broker. We can't dial directly then, but the list-sessions probe below still verifies
+		// liveness, so fall through to it instead of failing.
+		if !isSocketDialDenied(err) {
+			return fmt.Errorf("tmux socket %s exists but cannot be safely contacted: %w", socketPath, err)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), newSessionSocketProbeTimeout)
@@ -66,6 +71,12 @@ func (t *Tmux) ensureLiveSocketSafe(socketPath string) error {
 	} else {
 		return fmt.Errorf("tmux socket %s has a live listener but list-sessions failed; refusing to start a new session because tmux could unlink and rebind it (see gt-h9z): %w", socketPath, err)
 	}
+}
+
+// isSocketDialDenied reports whether a dial failed because the process isn't permitted to connect
+// (EPERM/EACCES), as opposed to the socket being absent, refused, or otherwise broken.
+func isSocketDialDenied(err error) bool {
+	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES)
 }
 
 func unixSocketStale(socketPath string) (bool, error) {
