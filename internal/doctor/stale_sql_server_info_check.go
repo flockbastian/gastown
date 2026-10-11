@@ -7,7 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
+
+	"github.com/steveyegge/gastown/internal/pidalive"
 )
 
 // StaleSQLServerInfoCheck detects stale sql-server.info files left by crashed
@@ -142,7 +143,7 @@ func (c *StaleSQLServerInfoCheck) isStale(path string) bool {
 		return true
 	}
 
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
+	if !pidalive.Proc(proc) {
 		return true // Process is dead
 	}
 

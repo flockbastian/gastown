@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/pidalive"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -58,7 +59,7 @@ func cleanupOrphanedClaude(graceSecs int) {
 	var killedCount, alreadyDeadCount int
 	for _, pid := range termPIDs {
 		// Check if process still exists
-		if err := syscall.Kill(pid, 0); err != nil {
+		if !pidalive.Alive(pid) {
 			// Process is gone (either died from SIGTERM or doesn't exist)
 			alreadyDeadCount++
 			continue

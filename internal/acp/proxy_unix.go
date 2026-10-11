@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/pidalive"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -28,8 +29,7 @@ func (p *Proxy) isProcessAlive() bool {
 	if p.cmd == nil || p.cmd.Process == nil {
 		return false
 	}
-	err := p.cmd.Process.Signal(syscall.Signal(0))
-	return err == nil
+	return pidalive.Proc(p.cmd.Process)
 }
 
 // terminateProcess gracefully terminates the agent process.

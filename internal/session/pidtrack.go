@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/steveyegge/gastown/internal/pidalive"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -123,7 +124,7 @@ func KillTrackedPIDs(townRoot string) (killed int, errSessions []string) {
 		}
 
 		// Signal 0 checks existence without killing
-		if err := proc.Signal(syscall.Signal(0)); err != nil {
+		if !pidalive.Proc(proc) {
 			// Process is already dead — clean up PID file
 			_ = os.Remove(path)
 			continue

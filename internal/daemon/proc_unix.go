@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+
+	"github.com/steveyegge/gastown/internal/pidalive"
 )
 
 // setSysProcAttr sets platform-specific process attributes.
@@ -18,7 +20,7 @@ func setSysProcAttr(cmd *exec.Cmd) {
 
 // isProcessAlive checks if a process is still running.
 func isProcessAlive(p *os.Process) bool {
-	return p.Signal(syscall.Signal(0)) == nil
+	return pidalive.Proc(p)
 }
 
 // sendTermSignal sends SIGTERM for graceful shutdown.

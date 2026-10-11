@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -26,6 +25,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/mayor"
+	"github.com/steveyegge/gastown/internal/pidalive"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -513,7 +513,7 @@ func ensureDaemon(townRoot string) error {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
 			if process, err := os.FindProcess(pid); err != nil {
 				stale = true
-			} else if err := process.Signal(syscall.Signal(0)); err != nil {
+			} else if !pidalive.Proc(process) {
 				stale = true
 			}
 		} else {

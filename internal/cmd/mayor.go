@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -13,6 +12,7 @@ import (
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/mayor"
+	"github.com/steveyegge/gastown/internal/pidalive"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -318,7 +318,7 @@ func gracefullyShutdownACP(townRoot string) error {
 	for i := 0; i < 30; i++ {
 		fmt.Fprintf(os.Stderr, ".")
 		// Check if process is still alive
-		if err := process.Signal(syscall.Signal(0)); err != nil {
+		if !pidalive.Proc(process) {
 			// Process has exited
 			fmt.Fprintf(os.Stderr, " done\n")
 			return nil

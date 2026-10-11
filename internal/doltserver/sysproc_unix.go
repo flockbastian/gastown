@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+
+	"github.com/steveyegge/gastown/internal/pidalive"
 )
 
 // setProcessGroup puts the command in its own process group so that signals
@@ -21,7 +23,7 @@ func processIsAlive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	return process.Signal(syscall.Signal(0)) == nil
+	return pidalive.Proc(process)
 }
 
 // gracefulTerminate sends SIGTERM for graceful shutdown on Unix.

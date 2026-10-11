@@ -5,6 +5,8 @@ package nudge
 import (
 	"os"
 	"syscall"
+
+	"github.com/steveyegge/gastown/internal/pidalive"
 )
 
 // detachedProcAttr returns SysProcAttr that detaches the child from
@@ -17,7 +19,7 @@ func detachedProcAttr() *syscall.SysProcAttr {
 
 // isProcessAlive checks if a process is running via signal 0.
 func isProcessAlive(proc *os.Process) bool {
-	return proc.Signal(syscall.Signal(0)) == nil
+	return pidalive.Proc(proc)
 }
 
 // terminateProcess sends SIGTERM for graceful shutdown.

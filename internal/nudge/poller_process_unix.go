@@ -4,7 +4,8 @@ package nudge
 
 import (
 	"os"
-	"syscall"
+
+	"github.com/steveyegge/gastown/internal/pidalive"
 )
 
 func pollerProcessAlive(pid int) bool {
@@ -17,5 +18,5 @@ func pollerProcessAlive(pid int) bool {
 		return false
 	}
 
-	return proc.Signal(syscall.Signal(0)) == nil
+	return pidalive.Proc(proc)
 }

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/pidalive"
 )
 
 // ActivateAgentLogging spawns a detached `gt agent-log` process to stream the
@@ -117,7 +119,7 @@ func killPreviousAgentLogger(pidFile string) {
 	// has exited (ESRCH on Linux/macOS).
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if err := proc.Signal(syscall.Signal(0)); err != nil {
+		if !pidalive.Proc(proc) {
 			break // process has exited
 		}
 		time.Sleep(50 * time.Millisecond)

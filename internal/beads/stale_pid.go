@@ -6,7 +6,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
+
+	"github.com/steveyegge/gastown/internal/pidalive"
 )
 
 // CleanStaleDoltServerPID removes the dolt-server.pid file inside a beads
@@ -38,7 +39,7 @@ func CleanStaleDoltServerPID(beadsDir string) {
 		return
 	}
 
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
+	if !pidalive.Proc(proc) {
 		// Process is dead — remove stale PID file
 		_ = os.Remove(pidPath)
 		fmt.Fprintf(os.Stderr, "Cleaned stale dolt-server.pid (PID %d) from %s\n", pid, beadsDir)

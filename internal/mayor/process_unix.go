@@ -4,7 +4,8 @@ package mayor
 
 import (
 	"os"
-	"syscall"
+
+	"github.com/steveyegge/gastown/internal/pidalive"
 )
 
 func acpProcessAlive(pid int) bool {
@@ -17,5 +18,5 @@ func acpProcessAlive(pid int) bool {
 		return false
 	}
 
-	return process.Signal(syscall.Signal(0)) == nil
+	return pidalive.Proc(process)
 }
