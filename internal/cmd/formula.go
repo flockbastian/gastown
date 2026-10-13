@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -34,6 +37,7 @@ var (
 	formulaRunAgent   string
 	formulaRunFiles   []string
 	formulaRunSet     []string
+	formulaRunRetry   string
 	formulaCreateType string
 )
 
@@ -121,6 +125,13 @@ Options:
   --rig=NAME    Target specific rig (default: inferred from cwd, or sole registered rig)
   --agent=ALIAS Override agent/runtime for all legs (e.g., gemini, codex)
   --dry-run     Show what would happen without executing
+  --retry-failed=CONVOY
+                Re-dispatch the legs of an existing convoy that failed to be
+                created or slung (convoy formulas only). Re-supply the same
+                --pr/--set/--files/--agent flags used for the original run.
+
+Exit status is non-zero if any leg of a convoy (or step of a workflow) could
+not be dispatched; the output lists each failed leg with its error.
 
 Agent precedence (highest to lowest):
   1. Per-leg 'agent' field in formula TOML
@@ -134,6 +145,7 @@ Examples:
   gt formula run shiny --pr=123           # Run on PR #123
   gt formula run security-audit --rig=beads  # Run in specific rig
   gt formula run release --dry-run        # Preview execution
+  gt formula run design --rig=willow --retry-failed=hq-cv-abc12  # Re-sling failed legs
   gt formula run code-review --agent=gemini  # All legs use gemini`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runFormulaRun,
@@ -174,6 +186,7 @@ func init() {
 	formulaRunCmd.Flags().StringVar(&formulaRunAgent, "agent", "", "Override agent/runtime for all legs (e.g., gemini, codex, claude-haiku)")
 	formulaRunCmd.Flags().StringSliceVar(&formulaRunFiles, "files", nil, "Files to pass to formula legs (available as {{.files}} in templates)")
 	formulaRunCmd.Flags().StringSliceVar(&formulaRunSet, "set", nil, "Set input variables as key=value pairs (available as {{.key}} in templates)")
+	formulaRunCmd.Flags().StringVar(&formulaRunRetry, "retry-failed", "", "Re-dispatch undispatched legs of an existing convoy (convoy ID) instead of creating a new one")
 
 	// Create flags
 	formulaCreateCmd.Flags().StringVar(&formulaCreateType, "type", "task", "Formula type: task, workflow, or patrol")
@@ -285,6 +298,10 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 	// Handle dry-run mode
 	if formulaRunDryRun {
 		return dryRunFormula(f, formulaName, targetRig)
+	}
+
+	if formulaRunRetry != "" && f.Type != formula.TypeConvoy {
+		return fmt.Errorf("--retry-failed is only supported for convoy formulas (formula '%s' is type '%s')", formulaName, f.Type)
 	}
 
 	switch f.Type {
@@ -425,8 +442,166 @@ func dryRunFormula(f *formula.Formula, formulaName, targetRig string) error {
 	return nil
 }
 
-// executeConvoyFormula spawns a convoy of polecats to execute a convoy formula
+// Labels used to find the beads of a formula convoy again when resuming a
+// partially dispatched run with --retry-failed. Leg beads live in the rig DB,
+// so lookups by label do not depend on convoy tracking relations.
+const (
+	labelFormulaConvoyPrefix = "gt:formula-convoy:"
+	labelFormulaLegPrefix    = "gt:formula-leg:"
+	labelFormulaSynthPrefix  = "gt:formula-synthesis:"
+	labelDispatchFailed      = "gt:dispatch-failed"
+)
+
+// legDispatchFailure records a convoy leg (or workflow step) that could not be
+// created or slung.
+type legDispatchFailure struct {
+	LegID  string
+	BeadID string // empty when the bead itself could not be created
+	Stage  string // "create" or "sling"
+	Err    string
+}
+
+// formulaBead is the subset of a bd issue needed to resume a formula run.
+type formulaBead struct {
+	ID     string   `json:"id"`
+	Labels []string `json:"labels"`
+}
+
+func (b formulaBead) hasLabel(label string) bool {
+	return slices.Contains(b.Labels, label)
+}
+
+// listFormulaBeadsByLabel returns all beads (including closed) in beadsDir
+// carrying the given label.
+func listFormulaBeadsByLabel(beadsDir, label string) ([]formulaBead, error) {
+	out, err := BdCmd("list", "--label="+label, "--all", "--limit=0", "--json").
+		Dir(beadsDir).
+		Output()
+	if err != nil {
+		return nil, fmt.Errorf("listing beads labelled %s: %w", label, err)
+	}
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	var beadList []formulaBead
+	if err := json.Unmarshal(trimmed, &beadList); err != nil {
+		return nil, fmt.Errorf("parsing bead list for label %s: %w", label, err)
+	}
+	return beadList, nil
+}
+
+// loadFormulaConvoyDescription reads the description of an existing convoy bead.
+func loadFormulaConvoyDescription(townBeads, convoyID string) (string, error) {
+	out, err := BdCmd("show", convoyID, "--json").Dir(townBeads).Output()
+	if err != nil {
+		return "", fmt.Errorf("bd show %s: %w", convoyID, err)
+	}
+	var issues []struct {
+		ID          string `json:"id"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &issues); err != nil || len(issues) == 0 {
+		return "", fmt.Errorf("convoy %s not found", convoyID)
+	}
+	return issues[0].Description, nil
+}
+
+var formulaConvoyReviewIDRe = regexp.MustCompile(`(?m)^Review ID: (\S+)\s*$`)
+
+// convoyReviewID extracts the review ID recorded in a formula convoy description.
+func convoyReviewID(description string) string {
+	if m := formulaConvoyReviewIDRe.FindStringSubmatch(description); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// errWithOutput appends the last non-empty line of a command's stderr to err,
+// since a bare "exit status 1" says nothing about why a sling failed.
+func errWithOutput(err error, stderr string) string {
+	lines := strings.Split(strings.TrimSpace(stderr), "\n")
+	last := strings.TrimSpace(lines[len(lines)-1])
+	if last == "" {
+		return err.Error()
+	}
+	return fmt.Sprintf("%v: %s", err, last)
+}
+
+// markLegDispatchFailed labels and comments a leg bead that could not be slung
+// so the failure is visible on the bead and --retry-failed can find it.
+func markLegDispatchFailed(beadsDir, beadID, msg string) {
+	_ = BdCmd("update", beadID, "--add-label", labelDispatchFailed).
+		WithAutoCommit().Dir(beadsDir).Run()
+	_ = BdCmd("comments", "add", beadID, "Failed to sling: "+msg).
+		WithAutoCommit().Dir(beadsDir).Run()
+}
+
+// formulaRetryCommand builds the command that resumes a partially dispatched convoy.
+func formulaRetryCommand(formulaName, targetRig, convoyID string) string {
+	cmd := fmt.Sprintf("gt formula run %s --rig %s --retry-failed %s", formulaName, targetRig, convoyID)
+	if formulaRunPR > 0 {
+		cmd += fmt.Sprintf(" --pr %d", formulaRunPR)
+	}
+	return cmd
+}
+
+// printDispatchFailures lists each failed leg with its error.
+func printDispatchFailures(failures []legDispatchFailure, kind string) {
+	for _, fl := range failures {
+		bead := fl.BeadID
+		if bead == "" {
+			bead = "no bead"
+		}
+		fmt.Printf("  %s %s %s (%s, %s failed): %s\n",
+			style.Bold.Render("✗"), kind, fl.LegID, bead, fl.Stage, fl.Err)
+	}
+}
+
+// renderLegDescription builds the bead description for a convoy leg, including
+// the rendered base prompt when the formula defines one.
+func renderLegDescription(f *formula.Formula, leg formula.Leg, formulaName, targetDescription, reviewID, prTitle string,
+	changedFiles []map[string]interface{}, setVars map[string]interface{}, outputDir string) string {
+	if f.Prompts == nil {
+		return leg.Description
+	}
+	basePrompt, ok := f.Prompts["base"]
+	if !ok {
+		return leg.Description
+	}
+	legCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+		formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
+	legCtx["leg"] = map[string]interface{}{
+		"id":          leg.ID,
+		"title":       leg.Title,
+		"focus":       leg.Focus,
+		"description": leg.Description,
+	}
+
+	// Compute output path for this leg
+	if f.Output != nil {
+		legPattern := renderTemplateOrDefault(f.Output.LegPattern, legCtx, leg.ID+"-findings.md")
+		outputPath := filepath.Join(outputDir, legPattern)
+		legCtx["output_path"] = outputPath
+		addOutputTemplateContext(legCtx, outputDir, f.Output.Synthesis)
+	}
+
+	// Render the base prompt with template context
+	renderedPrompt, err := renderTemplate(basePrompt, legCtx)
+	if err != nil {
+		fmt.Printf("%s Failed to render template for %s: %v\n",
+			style.Dim.Render("Warning:"), leg.ID, err)
+		renderedPrompt = basePrompt // Fall back to raw template
+	}
+	return fmt.Sprintf("%s\n\n---\nBase Prompt:\n%s", leg.Description, renderedPrompt)
+}
+
+// executeConvoyFormula spawns a convoy of polecats to execute a convoy formula.
+// It returns a non-nil error if any leg could not be created or slung, after
+// printing an X/N summary that names each failed leg. With --retry-failed the
+// legs of an existing convoy that were never dispatched are created/slung again.
 func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) error {
+	retrying := formulaRunRetry != ""
 	fmt.Printf("%s Executing convoy formula: %s\n\n",
 		style.Bold.Render("🚚"), formulaName)
 
@@ -454,48 +629,66 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		}
 	}
 
-	// Step 1: Create convoy bead
-	convoyID := fmt.Sprintf("%s-cv-%s", rigPrefix, generateFormulaShortID())
-	convoyTitle := fmt.Sprintf("%s: %s", formulaName, f.Description)
-	if len(convoyTitle) > 80 {
-		convoyTitle = convoyTitle[:77] + "..."
+	// Step 1: Create the convoy bead (or load it when retrying).
+	// The convoy lives in the town (hq) DB, so it gets the hq-cv- prefix like
+	// every other convoy; a rig prefix would make prefix routing look for it
+	// in the rig DB, where it does not exist.
+	var convoyID, reviewID string
+	if retrying {
+		convoyID = formulaRunRetry
+		desc, err := loadFormulaConvoyDescription(townBeads, convoyID)
+		if err != nil {
+			return fmt.Errorf("loading convoy for --retry-failed: %w", err)
+		}
+		reviewID = convoyReviewID(desc)
+		fmt.Printf("%s Retrying undispatched legs of convoy: %s\n", style.Bold.Render("↻"), convoyID)
+	}
+	if reviewID == "" {
+		// Unique review ID for this convoy run
+		reviewID = generateFormulaShortID()
 	}
 
-	// Build description with formula context
-	description := fmt.Sprintf("Formula convoy: %s\n\nLegs: %d\nRig: %s",
-		formulaName, len(f.Legs), targetRig)
-	if formulaRunPR > 0 {
-		description += fmt.Sprintf("\nPR: #%d", formulaRunPR)
-	}
+	if !retrying {
+		convoyID = fmt.Sprintf("hq-cv-%s", generateFormulaShortID())
+		convoyTitle := fmt.Sprintf("%s: %s", formulaName, f.Description)
+		if len(convoyTitle) > 80 {
+			convoyTitle = convoyTitle[:77] + "..."
+		}
 
-	// Guard against flag-like convoy titles (gt-e0kx5)
-	if beads.IsFlagLikeTitle(convoyTitle) {
-		return fmt.Errorf("refusing to create formula convoy: title %q looks like a CLI flag", convoyTitle)
-	}
+		// Build description with formula context
+		description := fmt.Sprintf("Formula convoy: %s\n\nLegs: %d\nRig: %s",
+			formulaName, len(f.Legs), targetRig)
+		if formulaRunPR > 0 {
+			description += fmt.Sprintf("\nPR: #%d", formulaRunPR)
+		}
+		description += fmt.Sprintf("\nReview ID: %s", reviewID)
 
-	createArgs := []string{
-		"create",
-		"--type=task",
-		"--id=" + convoyID,
-		"--title=" + convoyTitle,
-		"--description=" + description,
-		"--labels=gt:convoy",
-	}
-	if beads.NeedsForceForID(convoyID) {
-		createArgs = append(createArgs, "--force")
-	}
+		// Guard against flag-like convoy titles (gt-e0kx5)
+		if beads.IsFlagLikeTitle(convoyTitle) {
+			return fmt.Errorf("refusing to create formula convoy: title %q looks like a CLI flag", convoyTitle)
+		}
 
-	createCmd := exec.Command("bd", createArgs...)
-	createCmd.Dir = townBeads
-	createCmd.Stderr = os.Stderr
-	if err := createCmd.Run(); err != nil {
-		return fmt.Errorf("creating convoy bead: %w", err)
+		createArgs := []string{
+			"create",
+			"--type=task",
+			"--id=" + convoyID,
+			"--title=" + convoyTitle,
+			"--description=" + description,
+			"--labels=gt:convoy",
+		}
+		if beads.NeedsForceForID(convoyID) {
+			createArgs = append(createArgs, "--force")
+		}
+
+		createCmd := exec.Command("bd", createArgs...)
+		createCmd.Dir = townBeads
+		createCmd.Stderr = os.Stderr
+		if err := createCmd.Run(); err != nil {
+			return fmt.Errorf("creating convoy bead: %w", err)
+		}
+
+		fmt.Printf("%s Created convoy: %s\n", style.Bold.Render("✓"), convoyID)
 	}
-
-	fmt.Printf("%s Created convoy: %s\n", style.Bold.Render("✓"), convoyID)
-
-	// Generate a unique review ID for this convoy run
-	reviewID := generateFormulaShortID()
 
 	// Build target description
 	var targetDescription string
@@ -531,43 +724,48 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		}
 	}
 
-	// Step 2: Create leg beads and track them
-	legBeads := make(map[string]string) // leg.ID -> bead ID
-	for _, leg := range f.Legs {
-		legBeadID := fmt.Sprintf("%s-leg-%s", rigPrefix, generateFormulaShortID())
-
-		// Build leg description with prompt if available
-		legDesc := leg.Description
-		if f.Prompts != nil {
-			if basePrompt, ok := f.Prompts["base"]; ok {
-				// Build template context for this leg
-				legCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
-					formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
-				legCtx["leg"] = map[string]interface{}{
-					"id":          leg.ID,
-					"title":       leg.Title,
-					"focus":       leg.Focus,
-					"description": leg.Description,
+	// When retrying, find the leg beads created by the original run.
+	existingLegs := make(map[string]formulaBead) // leg.ID -> existing bead
+	if retrying {
+		existing, err := listFormulaBeadsByLabel(rigBeadsDir, labelFormulaConvoyPrefix+convoyID)
+		if err != nil {
+			return fmt.Errorf("finding legs of convoy %s: %w", convoyID, err)
+		}
+		for _, b := range existing {
+			for _, l := range b.Labels {
+				if legID, ok := strings.CutPrefix(l, labelFormulaLegPrefix); ok {
+					existingLegs[legID] = b
 				}
-
-				// Compute output path for this leg
-				if f.Output != nil {
-					legPattern := renderTemplateOrDefault(f.Output.LegPattern, legCtx, leg.ID+"-findings.md")
-					outputPath := filepath.Join(outputDir, legPattern)
-					legCtx["output_path"] = outputPath
-					addOutputTemplateContext(legCtx, outputDir, f.Output.Synthesis)
-				}
-
-				// Render the base prompt with template context
-				renderedPrompt, err := renderTemplate(basePrompt, legCtx)
-				if err != nil {
-					fmt.Printf("%s Failed to render template for %s: %v\n",
-						style.Dim.Render("Warning:"), leg.ID, err)
-					renderedPrompt = basePrompt // Fall back to raw template
-				}
-				legDesc = fmt.Sprintf("%s\n\n---\nBase Prompt:\n%s", leg.Description, renderedPrompt)
 			}
 		}
+	}
+
+	// Step 2: Create leg beads and track them
+	totalLegs := len(f.Legs)
+	legBeads := make(map[string]string) // leg.ID -> bead ID
+	needSling := make(map[string]bool)  // leg.ID -> still has to be slung
+	hadFailedLabel := make(map[string]bool)
+	var newLegBeads []string
+	var failures []legDispatchFailure
+	alreadyDispatched := 0
+	for _, leg := range f.Legs {
+		if existing, ok := existingLegs[leg.ID]; ok {
+			legBeads[leg.ID] = existing.ID
+			if existing.hasLabel(labelDispatchFailed) {
+				needSling[leg.ID] = true
+				hadFailedLabel[leg.ID] = true
+				fmt.Printf("  %s Leg %s (%s) was not dispatched; will re-sling\n",
+					style.Dim.Render("↻"), leg.ID, existing.ID)
+			} else {
+				alreadyDispatched++
+				fmt.Printf("  %s Leg %s (%s) already dispatched\n",
+					style.Dim.Render("○"), leg.ID, existing.ID)
+			}
+			continue
+		}
+
+		legBeadID := fmt.Sprintf("%s-leg-%s", rigPrefix, generateFormulaShortID())
+		legDesc := renderLegDescription(f, leg, formulaName, targetDescription, reviewID, prTitle, changedFiles, setVars, outputDir)
 
 		legArgs := []string{
 			"create",
@@ -575,34 +773,58 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 			"--id=" + legBeadID,
 			"--title=" + leg.Title,
 			"--description=" + legDesc,
+			"--labels=" + labelFormulaConvoyPrefix + convoyID + "," + labelFormulaLegPrefix + leg.ID,
 		}
 		if beads.NeedsForceForID(legBeadID) {
 			legArgs = append(legArgs, "--force")
 		}
 
+		var createStderr bytes.Buffer
 		if err := BdCmd(legArgs...).
 			WithAutoCommit().
 			Dir(rigBeadsDir).
-			Stderr(os.Stderr).
+			Stderr(io.MultiWriter(os.Stderr, &createStderr)).
 			Run(); err != nil {
-			fmt.Printf("%s Failed to create leg bead for %s: %v\n",
-				style.Dim.Render("Warning:"), leg.ID, err)
+			msg := errWithOutput(err, createStderr.String())
+			fmt.Printf("%s Failed to create leg bead for %s: %s\n",
+				style.Dim.Render("Warning:"), leg.ID, msg)
+			failures = append(failures, legDispatchFailure{LegID: leg.ID, Stage: "create", Err: msg})
 			continue
 		}
 
-		// Track the leg with the convoy
-		if err := addTrackingRelationFn(townBeads, convoyID, legBeadID); err != nil {
+		// Track the leg with the convoy. addTrackingRelationFn takes the town
+		// ROOT (not the .beads dir): it needs the root to read routes.jsonl and
+		// rewrite rig-prefixed IDs to external:<prefix>:<id> references.
+		if err := addTrackingRelationFn(townRoot, convoyID, legBeadID); err != nil {
 			fmt.Printf("%s Failed to track leg %s: %v\n",
 				style.Dim.Render("Warning:"), leg.ID, err)
 		}
 
 		legBeads[leg.ID] = legBeadID
+		needSling[leg.ID] = true
+		newLegBeads = append(newLegBeads, legBeadID)
 		fmt.Printf("  %s Created leg: %s (%s)\n", style.Dim.Render("○"), leg.ID, legBeadID)
 	}
 
 	// Step 3: Create synthesis bead if defined
 	var synthesisBeadID string
 	if f.Synthesis != nil {
+		if retrying {
+			// Reuse the synthesis bead from the original run; new legs only
+			// need a dependency edge to it.
+			if existing, err := listFormulaBeadsByLabel(rigBeadsDir, labelFormulaSynthPrefix+convoyID); err == nil && len(existing) > 0 {
+				synthesisBeadID = existing[0].ID
+				for _, legBeadID := range newLegBeads {
+					_ = BdCmd("dep", "add", synthesisBeadID, legBeadID).
+						WithAutoCommit().
+						Dir(rigBeadsDir).
+						Run()
+				}
+				fmt.Printf("  %s Reusing synthesis: %s\n", style.Dim.Render("★"), synthesisBeadID)
+			}
+		}
+	}
+	if f.Synthesis != nil && synthesisBeadID == "" {
 		synthesisBeadID = fmt.Sprintf("%s-syn-%s", rigPrefix, generateFormulaShortID())
 
 		synDesc := f.Synthesis.Description
@@ -627,6 +849,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 			"--id=" + synthesisBeadID,
 			"--title=" + f.Synthesis.Title,
 			"--description=" + synDesc,
+			"--labels=" + labelFormulaSynthPrefix + convoyID,
 		}
 		if beads.NeedsForceForID(synthesisBeadID) {
 			synArgs = append(synArgs, "--force")
@@ -639,9 +862,10 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 			Run(); err != nil {
 			fmt.Printf("%s Failed to create synthesis bead: %v\n",
 				style.Dim.Render("Warning:"), err)
+			synthesisBeadID = ""
 		} else {
 			// Track synthesis with convoy
-			_ = addTrackingRelationFn(townBeads, convoyID, synthesisBeadID)
+			_ = addTrackingRelationFn(townRoot, convoyID, synthesisBeadID)
 
 			// Add dependencies: synthesis depends on all legs
 			for _, legBeadID := range legBeads {
@@ -658,48 +882,65 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 	// Step 4: Sling each leg to a polecat
 	fmt.Printf("\n%s Dispatching legs to polecats...\n\n", style.Bold.Render("→"))
 
-	slingCount := 0
+	slingCount := alreadyDispatched
 	for _, leg := range f.Legs {
-		legBeadID, ok := legBeads[leg.ID]
-		if !ok {
+		if !needSling[leg.ID] {
 			continue
 		}
-
-		// Build context message for the polecat
-		contextMsg := fmt.Sprintf("Convoy leg: %s\nFocus: %s", leg.Title, leg.Focus)
+		legBeadID := legBeads[leg.ID]
 
 		// Agent precedence (GH#2118): per-leg > CLI --agent > formula-level
 		legAgent := resolveFormulaLegAgent(leg.Agent, formulaRunAgent, f.Agent)
 
 		slingArgs := buildConvoyLegSlingArgs(legBeadID, targetRig, leg.Description, leg.Title, legAgent, leg.ReviewOnly || f.ReviewOnly)
 
+		var slingStderr bytes.Buffer
 		slingCmd := exec.Command("gt", slingArgs...)
 		slingCmd.Stdout = os.Stdout
-		slingCmd.Stderr = os.Stderr
+		slingCmd.Stderr = io.MultiWriter(os.Stderr, &slingStderr)
 
 		if err := slingCmd.Run(); err != nil {
-			fmt.Printf("%s Failed to sling leg %s: %v\n",
-				style.Dim.Render("Warning:"), leg.ID, err)
-			// Add comment to bead about failure
-			commentArgs := []string{"comments", "add", legBeadID, fmt.Sprintf("Failed to sling: %v", err)}
-			commentCmd := exec.Command("bd", commentArgs...)
-			commentCmd.Dir = townBeads
-			_ = commentCmd.Run()
+			msg := errWithOutput(err, slingStderr.String())
+			fmt.Printf("%s Failed to sling leg %s: %s\n",
+				style.Dim.Render("Warning:"), leg.ID, msg)
+			// Label and comment the bead so the failure is visible and resumable.
+			markLegDispatchFailed(rigBeadsDir, legBeadID, msg)
+			failures = append(failures, legDispatchFailure{LegID: leg.ID, BeadID: legBeadID, Stage: "sling", Err: msg})
 			continue
 		}
 
+		if hadFailedLabel[leg.ID] {
+			_ = BdCmd("update", legBeadID, "--remove-label", labelDispatchFailed).
+				WithAutoCommit().Dir(rigBeadsDir).Run()
+		}
 		slingCount++
-		_ = contextMsg // Used in future for richer context
 	}
 
 	// Summary
-	fmt.Printf("\n%s Convoy dispatched!\n", style.Bold.Render("✓"))
+	if len(failures) == 0 {
+		fmt.Printf("\n%s Convoy dispatched!\n", style.Bold.Render("✓"))
+	} else {
+		fmt.Printf("\n%s Convoy only partially dispatched: %d/%d legs dispatched\n",
+			style.Bold.Render("✗"), slingCount, totalLegs)
+	}
 	fmt.Printf("  Convoy:  %s\n", convoyID)
-	fmt.Printf("  Legs:    %d dispatched\n", slingCount)
+	fmt.Printf("  Legs:    %d/%d dispatched\n", slingCount, totalLegs)
+	printDispatchFailures(failures, "Leg")
 	if synthesisBeadID != "" {
 		fmt.Printf("  Synthesis: %s (blocked until legs complete)\n", synthesisBeadID)
 	}
 	fmt.Printf("\n  Track progress: gt convoy status %s\n", convoyID)
+
+	if len(failures) > 0 {
+		retryCmd := formulaRetryCommand(formulaName, targetRig, convoyID)
+		fmt.Printf("  Retry failed legs: %s\n", retryCmd)
+		names := make([]string, 0, len(failures))
+		for _, fl := range failures {
+			names = append(names, fl.LegID)
+		}
+		return fmt.Errorf("convoy %s: only %d/%d legs dispatched (failed: %s); retry with: %s",
+			convoyID, slingCount, totalLegs, strings.Join(names, ", "), retryCmd)
+	}
 
 	return nil
 }
@@ -772,6 +1013,7 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 
 	// Step 2: Create step beads and wire dependencies
 	stepBeads := make(map[string]string) // step.ID -> bead ID
+	var failures []legDispatchFailure
 	setVars := parseSetVars(formulaRunSet)
 
 	for _, step := range f.Steps {
@@ -799,11 +1041,17 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 			Run(); err != nil {
 			fmt.Printf("%s Failed to create step bead for %s: %v\n",
 				style.Dim.Render("Warning:"), step.ID, err)
+			failures = append(failures, legDispatchFailure{LegID: step.ID, Stage: "create", Err: err.Error()})
 			continue
 		}
 
 		// Track the step with the workflow
-		_ = addTrackingRelationFn(townBeads, workflowID, stepBeadID)
+		// (takes the town root, not the .beads dir, so rig-prefixed step IDs
+		// are rewritten to external references)
+		if err := addTrackingRelationFn(townRoot, workflowID, stepBeadID); err != nil {
+			fmt.Printf("%s Failed to track step %s: %v\n",
+				style.Dim.Render("Warning:"), step.ID, err)
+		}
 
 		// Wire dependencies: this step depends on its needs
 		for _, needID := range step.Needs {
@@ -884,14 +1132,19 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 
 		slingCmd := exec.Command("gt", slingArgs...)
 		slingCmd.Stdout = os.Stdout
-		slingCmd.Stderr = os.Stderr
+
+		var slingStderr bytes.Buffer
+		slingCmd.Stderr = io.MultiWriter(os.Stderr, &slingStderr)
 
 		if err := slingCmd.Run(); err != nil {
-			fmt.Printf("%s Failed to sling step %s: %v\n",
-				style.Dim.Render("Warning:"), step.ID, err)
-			_ = BdCmd("comments", "add", stepBeadID, fmt.Sprintf("Failed to sling: %v", err)).
-				Dir(townBeads).
+			msg := errWithOutput(err, slingStderr.String())
+			fmt.Printf("%s Failed to sling step %s: %s\n",
+				style.Dim.Render("Warning:"), step.ID, msg)
+			_ = BdCmd("comments", "add", stepBeadID, "Failed to sling: "+msg).
+				WithAutoCommit().
+				Dir(rigBeadsDir).
 				Run()
+			failures = append(failures, legDispatchFailure{LegID: step.ID, BeadID: stepBeadID, Stage: "sling", Err: msg})
 			continue
 		}
 
@@ -900,7 +1153,12 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 
 	// Summary
 	blockedCount := len(f.Steps) - slingCount - interactiveCount
-	fmt.Printf("\n%s Workflow dispatched!\n", style.Bold.Render("✓"))
+	if len(failures) == 0 {
+		fmt.Printf("\n%s Workflow dispatched!\n", style.Bold.Render("✓"))
+	} else {
+		fmt.Printf("\n%s Workflow only partially dispatched (%d step failure(s))\n",
+			style.Bold.Render("✗"), len(failures))
+	}
 	fmt.Printf("  Workflow: %s\n", workflowID)
 	if interactiveCount > 0 {
 		fmt.Printf("  Steps:    %d total, %d interactive (current session), %d dispatched, %d awaiting dependencies\n",
@@ -913,6 +1171,16 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 			len(f.Steps), slingCount, blockedCount)
 	}
 	fmt.Printf("\n  Track progress: gt convoy status %s\n", workflowID)
+
+	if len(failures) > 0 {
+		printDispatchFailures(failures, "Step")
+		names := make([]string, 0, len(failures))
+		for _, fl := range failures {
+			names = append(names, fl.LegID)
+		}
+		return fmt.Errorf("workflow %s: %d step(s) failed to dispatch: %s",
+			workflowID, len(failures), strings.Join(names, ", "))
+	}
 
 	return nil
 }
