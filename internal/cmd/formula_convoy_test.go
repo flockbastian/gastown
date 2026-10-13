@@ -76,10 +76,10 @@ func setupFormulaStubTown(t *testing.T) *formulaStubTown {
 	}
 
 	// Formula run flags are package globals; restore them after the test.
-	oldPR, oldAgent, oldFiles, oldSet := formulaRunPR, formulaRunAgent, formulaRunFiles, formulaRunSet
-	formulaRunPR, formulaRunAgent, formulaRunFiles, formulaRunSet = 0, "", nil, nil
+	oldPR, oldRetry, oldAgent, oldFiles, oldSet := formulaRunPR, formulaRunRetry, formulaRunAgent, formulaRunFiles, formulaRunSet
+	formulaRunPR, formulaRunRetry, formulaRunAgent, formulaRunFiles, formulaRunSet = 0, "", "", nil, nil
 	t.Cleanup(func() {
-		formulaRunPR, formulaRunAgent, formulaRunFiles, formulaRunSet = oldPR, oldAgent, oldFiles, oldSet
+		formulaRunPR, formulaRunRetry, formulaRunAgent, formulaRunFiles, formulaRunSet = oldPR, oldRetry, oldAgent, oldFiles, oldSet
 	})
 
 	return &formulaStubTown{root: root, log: logPath, rigDir: rigDir}
