@@ -133,6 +133,15 @@ type Daemon struct {
 	// legacySocketCleanupOnce ensures upgrade cleanup only runs once per daemon
 	// lifetime, before any patrol agent can be started on the current socket.
 	legacySocketCleanupOnce sync.Once
+
+	// authStuck deduplicates alerts for agent sessions stuck on auth errors.
+	authStuck authStuckTracker
+
+	// notifyHumanFn / escalateFn override the human-notification and HIGH
+	// escalation senders used by auth-stuck detection. Nil in production
+	// (defaults to notifyHuman / escalate); set by tests.
+	notifyHumanFn func(priority, title, msg string)
+	escalateFn    func(source, message string)
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -2646,7 +2655,17 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 	}
 
 	if sessionAlive {
-		// Session is alive - nothing to do
+		// Session is alive. Its liveness says nothing about whether it can
+		// make progress: an agent blocked on expired credentials looks healthy
+		// to every heartbeat check. Alert (never restart) if it holds work.
+		d.checkAuthStuck(sessionName, rigName+"/"+polecatName, func() string {
+			prefix := beads.GetPrefixForRig(d.config.TownRoot, rigName)
+			info, err := d.getAgentBeadInfo(beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName))
+			if err != nil || info == nil {
+				return ""
+			}
+			return info.HookBead
+		})
 		return
 	}
 
