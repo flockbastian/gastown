@@ -295,6 +295,17 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	}
 	townBeadsDir := filepath.Join(townRoot, ".beads")
 
+	// Refuse early when AWS credentials are expired (hq-41af): a polecat slung
+	// work with dead credentials sits idle with its bead hooked and nobody
+	// notices. Checked once here, before any bead/convoy/polecat is created,
+	// which covers the single, batch and deferred-scheduling paths. Dry runs
+	// create nothing, so they are never blocked.
+	if !slingDryRun {
+		if err := checkAWSPreflight(townRoot); err != nil {
+			return err
+		}
+	}
+
 	// Normalize target arguments: trim trailing slashes from target to handle tab-completion
 	// artifacts like "gt sling sl-123 slingshot/" → "gt sling sl-123 slingshot"
 	// This makes sling more forgiving without breaking existing functionality.

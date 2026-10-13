@@ -304,6 +304,17 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--retry-failed is only supported for convoy formulas (formula '%s' is type '%s')", formulaName, f.Type)
 	}
 
+	// Refuse early when AWS credentials are expired (hq-41af), before any
+	// convoy/leg beads are created or polecats slung. Applies to --retry-failed
+	// too. Dry runs returned above and are never blocked.
+	if f.Type == formula.TypeConvoy || f.Type == formula.TypeWorkflow {
+		if townRoot, err := workspace.FindFromCwd(); err == nil {
+			if err := checkAWSPreflight(townRoot); err != nil {
+				return err
+			}
+		}
+	}
+
 	switch f.Type {
 	case formula.TypeConvoy:
 		return executeConvoyFormula(f, formulaName, targetRig)
