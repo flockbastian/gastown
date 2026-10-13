@@ -455,7 +455,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 	}
 
 	// Step 1: Create convoy bead
-	convoyID := fmt.Sprintf("%s-cv-%s", rigPrefix, generateFormulaShortID())
+	convoyID := fmt.Sprintf("hq-cv-%s", generateFormulaShortID())
 	convoyTitle := fmt.Sprintf("%s: %s", formulaName, f.Description)
 	if len(convoyTitle) > 80 {
 		convoyTitle = convoyTitle[:77] + "..."
@@ -591,7 +591,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		}
 
 		// Track the leg with the convoy
-		if err := addTrackingRelationFn(townBeads, convoyID, legBeadID); err != nil {
+		if err := addTrackingRelationFn(townRoot, convoyID, legBeadID); err != nil {
 			fmt.Printf("%s Failed to track leg %s: %v\n",
 				style.Dim.Render("Warning:"), leg.ID, err)
 		}
@@ -641,7 +641,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 				style.Dim.Render("Warning:"), err)
 		} else {
 			// Track synthesis with convoy
-			_ = addTrackingRelationFn(townBeads, convoyID, synthesisBeadID)
+			_ = addTrackingRelationFn(townRoot, convoyID, synthesisBeadID)
 
 			// Add dependencies: synthesis depends on all legs
 			for _, legBeadID := range legBeads {
@@ -803,7 +803,7 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 		}
 
 		// Track the step with the workflow
-		_ = addTrackingRelationFn(townBeads, workflowID, stepBeadID)
+		_ = addTrackingRelationFn(townRoot, workflowID, stepBeadID)
 
 		// Wire dependencies: this step depends on its needs
 		for _, needID := range step.Needs {
